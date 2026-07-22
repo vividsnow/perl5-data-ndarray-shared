@@ -41,8 +41,12 @@ static void nda_boot_pdl(pTHX) {
  * explicitly, which frees the handle and zeroes the IV; EXTRACT's mortal
  * pins the referent only against refcount-driven destruction, not an
  * explicit DESTROY, so the local `h` would dangle.  Used only where magic
- * can actually intervene between EXTRACT and the first use of h. */
+ * can actually intervene between EXTRACT and the first use of h.
+ * The same Perl can also REPLACE the invocant ($obj = 42 mutates ST(0),
+ * because Perl passes aliases), hence the SvROK re-check before SvRV. */
 #define REEXTRACT(sv) \
+    if (!SvROK(sv)) \
+        croak("Data::NDArray::Shared object was replaced during the call"); \
     h = INT2PTR(NdaHandle*, SvIV(SvRV(sv))); \
     if (!h) croak("Data::NDArray::Shared object destroyed during the call")
 
@@ -258,11 +262,16 @@ static void nda_unlock_pair(NdaHandle *a, NdaHandle *b) {
  * deadlock-free id order (or a single wrlock for self/same-id), apply the
  * element-wise op, bump stat_ops, and unlock.  `op` is '+', '-' or '*'; `who`
  * is the fully-qualified method name used in croak messages. */
-static void nda_do_elementwise(pTHX_ NdaHandle *h, SV *other, int op, const char *who) {
+static void nda_do_elementwise(pTHX_ SV *self_sv, NdaHandle *h, SV *other, int op, const char *who) {
     if (!sv_isobject(other) || !sv_derived_from(other, "Data::NDArray::Shared"))
         croak("%s: expected a Data::NDArray::Shared object", who);
     NdaHandle *o = INT2PTR(NdaHandle*, SvIV(SvRV(other)));
     if (!o) croak("Attempted to use a destroyed Data::NDArray::Shared object");
+    /* sv_isobject/sv_derived_from above begin with SvGETMAGIC(other), so a tied
+     * `other` can have run Perl that destroyed self before h is used below.
+     * `h` is this function's own parameter, so re-reading it here is enough;
+     * `o` was read after the magic and needs no re-read. */
+    REEXTRACT(self_sv);
     if (o->dtype != h->dtype)   /* cached: the kernel interprets both in the cached dtype */
         croak("%s: dtype mismatch", who);
     if (o->size != h->size)   /* cached immutable counts, not peer hdr->size */
@@ -688,7 +697,7 @@ add(self, other)
   PREINIT:
     EXTRACT(self);
   CODE:
-    nda_do_elementwise(aTHX_ h, other, '+', "Data::NDArray::Shared->add");
+    nda_do_elementwise(aTHX_ self, h, other, '+', "Data::NDArray::Shared->add");
     SvREFCNT_inc(self);
     RETVAL = self;
   OUTPUT:
@@ -701,7 +710,7 @@ subtract(self, other)
   PREINIT:
     EXTRACT(self);
   CODE:
-    nda_do_elementwise(aTHX_ h, other, '-', "Data::NDArray::Shared->subtract");
+    nda_do_elementwise(aTHX_ self, h, other, '-', "Data::NDArray::Shared->subtract");
     SvREFCNT_inc(self);
     RETVAL = self;
   OUTPUT:
@@ -714,7 +723,7 @@ multiply(self, other)
   PREINIT:
     EXTRACT(self);
   CODE:
-    nda_do_elementwise(aTHX_ h, other, '*', "Data::NDArray::Shared->multiply");
+    nda_do_elementwise(aTHX_ self, h, other, '*', "Data::NDArray::Shared->multiply");
     SvREFCNT_inc(self);
     RETVAL = self;
   OUTPUT:

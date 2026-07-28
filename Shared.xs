@@ -34,6 +34,7 @@ static void nda_boot_pdl(pTHX) {
         croak("Expected a Data::NDArray::Shared object"); \
     NdaHandle *h = INT2PTR(NdaHandle*, SvIV(SvRV(sv))); \
     if (!h) croak("Attempted to use a destroyed Data::NDArray::Shared object"); \
+    NdaHandle *h0 = h; PERL_UNUSED_VAR(h0); \
     sv_2mortal(SvREFCNT_inc(SvRV(sv)))
 
 /* Re-read the handle after a call that can run Perl code (tied/overloaded
@@ -48,7 +49,7 @@ static void nda_boot_pdl(pTHX) {
     if (!SvROK(sv)) \
         croak("Data::NDArray::Shared object was replaced during the call"); \
     h = INT2PTR(NdaHandle*, SvIV(SvRV(sv))); \
-    if (!h) croak("Data::NDArray::Shared object destroyed during the call")
+    if (h != h0) croak("Data::NDArray::Shared object replaced or destroyed during the call")
 
 #define MAKE_OBJ(class, handle) \
     SV *obj = newSViv(PTR2IV(handle)); \
@@ -263,6 +264,7 @@ static void nda_unlock_pair(NdaHandle *a, NdaHandle *b) {
  * element-wise op, bump stat_ops, and unlock.  `op` is '+', '-' or '*'; `who`
  * is the fully-qualified method name used in croak messages. */
 static void nda_do_elementwise(pTHX_ SV *self_sv, NdaHandle *h, SV *other, int op, const char *who) {
+    NdaHandle *h0 = h; PERL_UNUSED_VAR(h0);   /* identity anchor for the REEXTRACT below */
     if (!sv_isobject(other) || !sv_derived_from(other, "Data::NDArray::Shared"))
         croak("%s: expected a Data::NDArray::Shared object", who);
     NdaHandle *o = INT2PTR(NdaHandle*, SvIV(SvRV(other)));

@@ -128,7 +128,8 @@ struct NdaHeader {
     uint32_t drain_seq;               /* 200  futex bumped by a reader releasing under a draining writer (wakes it) */
     uint32_t slotless_rdepth;         /* 204  readers holding with no reader-slot (documented residual) */
     uint64_t stat_ops;                /* 208 */
-    uint8_t  _pad[40];                /* 216..255 */
+    uint8_t  sealed;                  /* 216  0 = mutable, 1 = frozen (read-only; lock-free reads) */
+    uint8_t  _pad[39];                /* 217..255 */
 };
 typedef struct NdaHeader NdaHeader;
 
@@ -156,6 +157,7 @@ typedef struct NdaHandle {
     uint32_t       cached_pid;    /* getpid() cached at last slot claim */
     uint32_t       cached_fork_gen; /* nda_fork_gen value at last slot claim */
     uint32_t       slotless_held; /* read-locks this process holds with no reader-slot */
+    int            readonly;      /* 1 = frozen O_RDONLY/PROT_READ view: lock-free reads, mutation croaks */
 } NdaHandle;
 
 /* ================================================================
@@ -838,6 +840,10 @@ static NdaHandle *nda_create(const char *path, int dtype,
             if (!nda_validate_header((NdaHeader *)base, (uint64_t)stt.st_size)) {
                 NDA_ERR("invalid ndarray file"); munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
             }
+            if (((NdaHeader *)base)->sealed) {
+                NDA_ERR("%s is frozen (read-only); open it with new_readonly", path);
+                munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
+            }
             flock(fd, LOCK_UN); close(fd);
             return nda_setup(base, map_size, path, -1);
         }
@@ -877,6 +883,10 @@ static NdaHandle *nda_open_fd(int fd, char *errbuf) {
     if (!nda_validate_header((NdaHeader *)base, (uint64_t)stt.st_size)) {
         NDA_ERR("invalid ndarray"); munmap(base, ms); return NULL;
     }
+    if (((NdaHeader *)base)->sealed) {
+        NDA_ERR("this ndarray is frozen (read-only); open it with new_readonly");
+        munmap(base, ms); return NULL;
+    }
     int myfd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
     if (myfd < 0) { NDA_ERR("fcntl: %s", strerror(errno)); munmap(base, ms); return NULL; }
     return nda_setup(base, ms, NULL, myfd);
@@ -907,6 +917,50 @@ static void nda_destroy(NdaHandle *h) {
 static inline int nda_msync(NdaHandle *h) {
     if (!h || !h->base) return 0;
     return msync(h->base, h->mmap_size, MS_SYNC);
+}
+
+/* Open a FROZEN (sealed) file read-only: O_RDONLY + PROT_READ, no lock ever.
+ * The geometry (dtype/ndim/shape/strides/size) and data are immutable in a
+ * sealed file -- reshape and every other mutator are refused once sealed -- so
+ * every read (get, get_flat, sum, shape, stats, ...) proceeds directly with no
+ * reader-slot / rwlock traffic.  The mapping is never written, so it works from
+ * a read-only fd / read-only filesystem and can be shared PROT_READ across
+ * processes (same architecture; the native magic rejects a wrong-endian file at
+ * validation). */
+static NdaHandle *nda_open_readonly(const char *path, char *errbuf) {
+    if (errbuf) errbuf[0] = '\0';
+    int fd = open(path, O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
+    if (fd < 0) { NDA_ERR("open %s: %s", path, strerror(errno)); return NULL; }
+    struct stat st;
+    if (fstat(fd, &st) < 0) { NDA_ERR("fstat %s: %s", path, strerror(errno)); close(fd); return NULL; }
+    if ((uint64_t)st.st_size < sizeof(struct NdaHeader)) { NDA_ERR("%s: file too small", path); close(fd); return NULL; }
+    size_t ms = (size_t)st.st_size;
+    void *base = mmap(NULL, ms, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);   /* the mapping keeps the file; a read-only view needs no fd (no msync/ftruncate) */
+    if (base == MAP_FAILED) { NDA_ERR("mmap %s: %s", path, strerror(errno)); return NULL; }
+    if (!nda_validate_header((NdaHeader *)base, (uint64_t)st.st_size)) {
+        NDA_ERR("%s: invalid ndarray file", path); munmap(base, ms); return NULL;
+    }
+    if (!((NdaHeader *)base)->sealed) {
+        NDA_ERR("%s is not frozen: call ->freeze on the producer before opening read-only", path);
+        munmap(base, ms); return NULL;
+    }
+    NdaHandle *h = nda_setup(base, ms, path, -1);   /* munmaps on OOM */
+    if (!h) { NDA_ERR("out of memory"); return NULL; }
+    h->readonly = 1;
+    return h;
+}
+
+/* Seal an array: make it permanently immutable so it can be shipped and opened
+ * read-only.  Takes the write lock so no mutation is in flight, publishes the
+ * seal, then flushes it (file/memfd-backed).  Afterwards every mutator croaks
+ * and a read-write reopen is refused. */
+static int nda_freeze(NdaHandle *h) {
+    nda_rwlock_wrlock(h);
+    h->hdr->sealed = 1;
+    nda_rwlock_wrunlock(h);
+    if (h->path || h->backing_fd >= 0) return nda_msync(h);  /* durability for file/memfd-backed */
+    return 0;   /* anonymous: the seal lives in shared memory (visible to forks); nothing to flush */
 }
 
 #endif /* NDARRAY_H */

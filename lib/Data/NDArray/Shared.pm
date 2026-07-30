@@ -150,6 +150,11 @@ Data::NDArray::Shared - shared-memory typed N-dimensional numeric array for Linu
     # share across processes via a backing file ($path = the file)
     my $shared = Data::NDArray::Shared->new("/tmp/nd.bin", "f64", 100, 100);
 
+    # freeze and ship: query it read-only (lock-free) on other machines
+    $shared->freeze;
+    my $ro = Data::NDArray::Shared->new_readonly("/tmp/nd.bin");
+    $ro->get(0, 0);
+
 =head1 DESCRIPTION
 
 A dense, row-major numeric tensor in shared memory, shared across processes. The
@@ -222,6 +227,7 @@ access reads them under the read lock. B<Linux-only>. Requires 64-bit Perl.
     my $a = Data::NDArray::Shared->new_memfd($name, $dtype, @shape);
     my $a = Data::NDArray::Shared->new_memfd(undef, $dtype, @shape);
     my $a = Data::NDArray::Shared->new_from_fd($fd);
+    my $ro = Data::NDArray::Shared->new_readonly($path);   # frozen file, read-only
 
 C<$path> is the backing file (C<undef> for an anonymous mapping); C<$dtype> is
 the dtype name (C<f64>, C<i32>, ...); and C<@shape> is the shape:
@@ -239,7 +245,8 @@ When reopening an existing file or memfd, the B<stored dtype, shape and strides
 win> and the existing data is preserved; the dtype/shape you pass to C<new> on a
 reopen are only used when the file is brand new. C<new_memfd> creates a Linux
 memfd (transferable via its C<memfd> descriptor); C<new_from_fd> reopens one in
-another process.
+another process. C<new_readonly> opens a B<frozen> file read-only for lock-free
+access (see L</"FROZEN (READ-ONLY) MODE">).
 
 =head2 Element access
 
@@ -376,6 +383,11 @@ C<mul_scalar>, C<add>, C<subtract>, C<multiply>).
 
 =item * C<mmap_size> -- bytes of the shared mapping.
 
+=item * C<frozen> -- 1 if the array has been sealed by C<freeze> (immutable), else 0.
+
+=item * C<readonly> -- 1 if this handle is a read-only view (from C<new_readonly>,
+or the handle that called C<freeze>), else 0.
+
 =back
 
 =head1 PDL INTEROP
@@ -433,6 +445,13 @@ shared-memory view. Do not B<resize or retype> the alias (a reshape that grows
 it, a type conversion) -- it is a fixed window onto the mapping; use
 C<to_pdl>/C<from_pdl> when you want an independent, resizable copy.
 
+On a B<frozen> array (see L</"FROZEN (READ-ONLY) MODE">) the mapping itself is
+C<PROT_READ>, and PDL has no write path that is reliably safe against that (its
+own read-only flag stops C<< .= >> and in-place ops, but not
+C<< $piddle->set(...) >>, which pokes the buffer directly). So C<as_pdl_alias>
+B<refuses to alias a frozen array> and C<croak>s instead of handing back a
+piddle that could still crash the process; use C<to_pdl> for a safe copy.
+
 =item * C<< $bytes = $array->buffer >>
 
 The raw contiguous data region as a byte string (read-locked snapshot),
@@ -444,6 +463,54 @@ for C<to_pdl>. C<< $array->update_from_bytes($bytes) >> is the inverse
 
 See F<eg/pdl_interop.pl> for a worked example, including a cross-process PDL
 transform on one shared array.
+
+=head1 FROZEN (READ-ONLY) MODE
+
+A file-backed array can be B<frozen> and then shipped to other machines, where
+consumers open it B<read-only> and query it with B<no locking at all>.
+
+    # producer: build, freeze, ship the file
+    my $a = Data::NDArray::Shared->new("/tmp/weights.bin", "f64", 100, 100);
+    $a->fill(0); $a->set(0, 0, 1.5);   # ... populate ...
+    $a->freeze;                  # seal: now immutable, and $a itself is read-only
+    # ... copy /tmp/weights.bin to another host ...
+
+    # consumer (any process, same architecture): read-only, lock-free
+    my $ro = Data::NDArray::Shared->new_readonly("/tmp/weights.bin");
+    $ro->get(0, 0);
+    $ro->sum;
+
+C<freeze> takes the write lock, marks the array B<permanently immutable> (there
+is no unfreeze -- rebuild the file to change it), and flushes the seal to disk.
+A frozen array rejects every mutator (C<set>, C<set_flat>, C<fill>, C<zero>,
+C<reshape>, C<add_scalar>, C<mul_scalar>, C<add>, C<subtract>, C<multiply>,
+C<update_from_bytes>) with a croak, and a read-write reopen (C<< new($path,
+...) >>) of a sealed file is B<refused> -- so a shipped artifact can never be
+silently mutated out from under its readers.
+
+C<new_readonly($path)> maps the file C<O_RDONLY> / C<PROT_READ> and B<requires
+it to be frozen> (it croaks on a file that was never C<freeze>d). Because a
+sealed array's data, dtype, shape and strides are all immutable (C<reshape> is
+one of the refused mutators), every read -- C<get>, C<get_flat>, C<sum>,
+C<mean>, C<min>, C<max>, C<to_list>, C<shape>, C<strides>, C<stats>, C<buffer>
+-- proceeds B<directly, taking no reader lock>. The mapping is never written,
+so a read-only view works from a read-only file descriptor or a read-only
+filesystem, and any number of processes can share one C<PROT_READ> mapping.
+C<frozen> and C<readonly> report the two states; C<sync> is a silent no-op on a
+read-only handle (there is nothing to flush). C<< $mutable->add($ro) >> and
+friends may combine a mutable array with a frozen C<other>: the frozen side is
+read without locking it, so this never touches its C<PROT_READ> mapping.
+
+C<as_pdl_alias> is the one exception: it B<refuses> to alias a frozen array
+(see L</"PDL INTEROP">) because PDL has no write path that is reliably safe
+against a C<PROT_READ> mapping -- use C<to_pdl> for a safe copy instead.
+
+B<Portability.> The on-disk format is native binary (native-endian 64-bit
+words), so a frozen file may be copied only between machines of the B<same
+architecture>; a wrong-endian file is rejected at open by the magic check.
+B<Copy the file to each consumer> -- do not share one file over a network
+filesystem: the lock is a Linux futex (process-local to one kernel), and the
+"no live writer" contract assumes a static copy. Linux-only; 64-bit Perl.
 
 =head1 SHARING ACROSS PROCESSES
 

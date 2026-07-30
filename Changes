@@ -1,6 +1,9 @@
 Revision history for Data-NDArray-Shared
 
 0.03      2026-07-22
+          - Add a frozen read-only mode: freeze() seals a file-backed array
+            immutable; new_readonly() opens it O_RDONLY / PROT_READ and
+            queries it lock-free.
           - Fix a use-after-free in add(), subtract() and multiply():
             sv_isobject on the peer argument runs get-magic, so a tied
             argument can destroy this object before its handle is used

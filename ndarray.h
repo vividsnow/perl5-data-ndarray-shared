@@ -706,7 +706,6 @@ static inline void nda_init_header(void *base, int dtype, const uint64_t *shape,
     /* Zero the header + reader-slot region (lock-recovery state) and the data
        buffer (fresh array starts all-zero). */
     memset(base, 0, (size_t)total_size);
-    hdr->magic            = NDA_MAGIC;
     hdr->version          = NDA_VERSION;
     hdr->dtype            = (uint32_t)dtype;
     hdr->ndim             = ndim;
@@ -717,6 +716,11 @@ static inline void nda_init_header(void *base, int dtype, const uint64_t *shape,
     hdr->reader_slots_off = L.reader_slots;
     hdr->data_off         = L.data;
     hdr->array_id         = nda_gen_array_id(base);
+    /* Publish magic LAST, as a release store: it is the commit point, so a
+       creator killed before this store leaves magic==0 -- which the
+       crashed-creator recovery treats as an abandoned mid-init file and
+       recovers, instead of a magic-set-but-incomplete header that would brick. */
+    __atomic_store_n(&hdr->magic, NDA_MAGIC, __ATOMIC_RELEASE);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
 
@@ -799,6 +803,16 @@ static int nda_secure_open(const char *path, mode_t mode, char *errbuf) {
     return -1;
 }
 
+/* True iff the whole mapped region is zero. A freshly ftruncate'd file (the only
+   thing an abandoned mid-init creator leaves) reads as all zeros, so this lets the
+   recovery re-init ONLY a provably-empty file and never a same-owner file that
+   merely starts with a zero word. Recovery is a cold path, so a byte scan is fine. */
+static inline int nda_region_is_zero(const void *p, size_t n) {
+    const unsigned char *b = (const unsigned char *)p;
+    for (size_t i = 0; i < n; i++) if (b[i]) return 0;
+    return 1;
+}
+
 static NdaHandle *nda_create(const char *path, int dtype,
                              const uint64_t *shape, uint32_t ndim, mode_t mode, char *errbuf) {
     uint64_t size, strides[NDA_MAX_DIMS], data_bytes;
@@ -844,7 +858,7 @@ static NdaHandle *nda_create(const char *path, int dtype,
                  * our size, still uninitialized (magic==0), and owned by us -- a valid or foreign file
                  * fails this and still errors, never clobbered. */
                 if (((NdaHeader *)base)->magic == 0 && (uint64_t)stt.st_size == total
-                    && stt.st_uid == geteuid()) {
+                    && stt.st_uid == geteuid() && nda_region_is_zero(base, map_size)) {
                     if (fchmod(fd, mode) < 0) {
                         NDA_ERR("%s: fchmod: %s", path, strerror(errno));
                         munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;

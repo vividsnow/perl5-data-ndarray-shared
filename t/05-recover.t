@@ -56,5 +56,14 @@ unlink $p;
     is($r->get(0, 1), 7.25, "reopening a valid file preserves its data");
     undef $r; unlink $p;
 }
+# 5. A magic==0 file of the right size but with NON-zero data (not a fresh
+#    ftruncate) is NOT recovered -- recovery only re-inits a provably-empty file.
+{
+    open my $zfh, '>', $p or die $!; truncate $zfh, $total or die $!; close $zfh;
+    open $zfh, '+<', $p or die $!; seek $zfh, $total - 1, 0; print $zfh "\x01"; close $zfh;
+    my $b = eval { Data::NDArray::Shared->new($p, "f64", 2, 3) };
+    ok(!$b, "new() refuses a magic==0 file that is not all-zero (no clobber of real data)");
+    undef $b; unlink $p;
+}
 
 done_testing;

@@ -377,7 +377,7 @@ new(class, ...)
             "Data::NDArray::Shared->new", &label, &dt, dims);   /* croaks before any alloc */
         const char *p = (SvGETMAGIC(label), SvOK(label)) ? SvPV_nolen(label) : NULL;
         NdaHandle *h = nda_create(p, dt, dims, ndim, mode, errbuf);
-        if (!h) croak("Data::NDArray::Shared->new: %s", errbuf);
+        if (!h) croak("Data::NDArray::Shared->new: %s", errbuf[0] ? errbuf : "out of memory");
         MAKE_OBJ(class, h);
     }
   OUTPUT:
@@ -396,7 +396,7 @@ new_memfd(class, ...)
             "Data::NDArray::Shared->new_memfd", &label, &dt, dims);
         const char *nm = (SvGETMAGIC(label), SvOK(label)) ? SvPV_nolen(label) : NULL;
         NdaHandle *h = nda_create_memfd(nm, dt, dims, ndim, errbuf);
-        if (!h) croak("Data::NDArray::Shared->new_memfd: %s", errbuf);
+        if (!h) croak("Data::NDArray::Shared->new_memfd: %s", errbuf[0] ? errbuf : "out of memory");
         MAKE_OBJ(class, h);
     }
   OUTPUT:
@@ -410,7 +410,7 @@ new_from_fd(class, fd)
     char errbuf[NDA_ERR_BUFLEN];
   CODE:
     NdaHandle *h = nda_open_fd(fd, errbuf);
-    if (!h) croak("Data::NDArray::Shared->new_from_fd: %s", errbuf);
+    if (!h) croak("Data::NDArray::Shared->new_from_fd: %s", errbuf[0] ? errbuf : "out of memory");
     MAKE_OBJ(class, h);
   OUTPUT:
     RETVAL

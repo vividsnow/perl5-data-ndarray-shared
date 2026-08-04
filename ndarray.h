@@ -838,6 +838,22 @@ static NdaHandle *nda_create(const char *path, int dtype,
         if (base == MAP_FAILED) { NDA_ERR("mmap: %s", strerror(errno)); flock(fd, LOCK_UN); close(fd); return NULL; }
         if (!is_new) {
             if (!nda_validate_header((NdaHeader *)base, (uint64_t)stt.st_size)) {
+                /* Recover an abandoned mid-init file: a creator killed between the ftruncate and
+                 * nda_init_header leaves a full-size, all-zero (magic==0) file that would otherwise
+                 * brick every future open of this path.  Re-initialize it, but ONLY when it is exactly
+                 * our size, still uninitialized (magic==0), and owned by us -- a valid or foreign file
+                 * fails this and still errors, never clobbered. */
+                if (((NdaHeader *)base)->magic == 0 && (uint64_t)stt.st_size == total
+                    && stt.st_uid == geteuid()) {
+                    if (fchmod(fd, mode) < 0) {
+                        NDA_ERR("%s: fchmod: %s", path, strerror(errno));
+                        munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
+                    }
+                    memset(base, 0, map_size);   /* start from a provably empty structure */
+                    nda_init_header(base, dtype, shape, ndim, size, strides, total);
+                    flock(fd, LOCK_UN); close(fd);
+                    return nda_setup(base, map_size, path, -1);
+                }
                 NDA_ERR("invalid ndarray file"); munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
             }
             if (((NdaHeader *)base)->sealed) {

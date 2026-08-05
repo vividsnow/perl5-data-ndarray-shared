@@ -863,7 +863,6 @@ static NdaHandle *nda_create(const char *path, int dtype,
                         NDA_ERR("%s: fchmod: %s", path, strerror(errno));
                         munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
                     }
-                    memset(base, 0, map_size);   /* start from a provably empty structure */
                     nda_init_header(base, dtype, shape, ndim, size, strides, total);
                     flock(fd, LOCK_UN); close(fd);
                     return nda_setup(base, map_size, path, -1);

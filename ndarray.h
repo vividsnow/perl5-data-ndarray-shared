@@ -717,9 +717,10 @@ static inline void nda_init_header(void *base, int dtype, const uint64_t *shape,
     hdr->data_off         = L.data;
     hdr->array_id         = nda_gen_array_id(base);
     /* Publish magic LAST, as a release store: it is the commit point, so a
-       creator killed before this store leaves magic==0 -- which the
-       crashed-creator recovery treats as an abandoned mid-init file and
-       recovers, instead of a magic-set-but-incomplete header that would brick. */
+       creator killed before it leaves magic==0 and the file is never mistaken
+       for a valid one.  Recovery re-initializes such a file only while it is
+       still all-zero (a kill during the ftruncate or the zeroing above); a kill
+       during the few field stores leaves a file to remove by hand. */
     __atomic_store_n(&hdr->magic, NDA_MAGIC, __ATOMIC_RELEASE);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
@@ -866,6 +867,11 @@ static NdaHandle *nda_create(const char *path, int dtype,
                     nda_init_header(base, dtype, shape, ndim, size, strides, total);
                     flock(fd, LOCK_UN); close(fd);
                     return nda_setup(base, map_size, path, -1);
+                }
+                if (((NdaHeader *)base)->magic == 0 && (uint64_t)stt.st_size == total
+                    && stt.st_uid == geteuid()) {
+                    NDA_ERR("%s: incomplete ndarray file left by an interrupted create; remove it and retry", path);
+                    munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
                 }
                 NDA_ERR("invalid ndarray file"); munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
             }

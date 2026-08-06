@@ -2,7 +2,7 @@ package Data::NDArray::Shared;
 use strict;
 use warnings;
 use Carp ();
-our $VERSION = '0.03';
+our $VERSION = '0.04';
 require XSLoader;
 XSLoader::load('Data::NDArray::Shared', $VERSION);
 
@@ -241,12 +241,14 @@ B<more than 8 dimensions>, or if the implied data buffer
 (C<product(shape) * itemsize>) would overflow or exceed an internal 1 TiB cap
 (C<shape too large>). A freshly created array is B<zero-filled>.
 
-When reopening an existing file or memfd, the B<stored dtype, shape and strides
-win> and the existing data is preserved; the dtype/shape you pass to C<new> on a
-reopen are only used when the file is brand new. C<new_memfd> creates a Linux
-memfd (transferable via its C<memfd> descriptor); C<new_from_fd> reopens one in
-another process. C<new_readonly> opens a B<frozen> file read-only for lock-free
-access (see L</"FROZEN (READ-ONLY) MODE">).
+When reopening an existing file or memfd, the B<stored dtype, shape and
+strides win> and the existing data is preserved; the dtype/shape you pass to
+C<new> on a reopen are only used when the file is brand new. C<new_memfd>
+creates a Linux memfd (transferable via its C<memfd> descriptor);
+C<new_from_fd> reopens one in another process. The descriptor you pass is
+duplicated (C<F_DUPFD_CLOEXEC>), so it stays yours to close and closing it
+does not disturb the handle. C<new_readonly> opens a B<frozen> file read-only
+for lock-free access (see L</"FROZEN (READ-ONLY) MODE">).
 
 =head2 Element access
 
@@ -532,15 +534,17 @@ they interleave.
 
 =head1 SECURITY
 
-Backing files are created with mode C<0600> (owner-only) by default, so only the
-creating user can open and attach them. To share a backing file across users,
-pass an explicit octal file mode such as C<0660> via a trailing options hashref,
-C<< Data::NDArray::Shared->new($path, $dtype, @dims, { mode => 0660 }) >>; the mode is applied
-only when the file is created (an existing file keeps its own permissions). The
-file is opened with C<O_NOFOLLOW>, so a symlink planted at the path is refused,
-and created with C<O_EXCL>; the on-disk header is validated when the file is
-attached. Any process you grant write access to a shared mapping is trusted not
-to corrupt its contents while other processes are using it.
+Backing files are created with mode C<0600> (owner-only) by default, so only
+the creating user can open and attach them. To share a backing file across
+users, pass an explicit octal file mode such as C<0660> via a trailing options
+hashref, C<< Data::NDArray::Shared->new($path, $dtype, @dims, { mode => 0660
+}) >>; the mode is applied when the file is created, and when a file left
+behind by an interrupted create is re-initialized (see L</CRASH SAFETY>); a
+file already in use keeps its own permissions. The file is opened with
+C<O_NOFOLLOW>, so a symlink planted at the path is refused, and created with
+C<O_EXCL>; the on-disk header is validated when the file is attached. Any
+process you grant write access to a shared mapping is trusted not to corrupt
+its contents while other processes are using it.
 
 =head1 CRASH SAFETY
 
@@ -562,6 +566,18 @@ reclaim it and writers may block until the mapping is recreated. Reaching this
 needs more than 1024 concurrent reader processes on one mapping plus a crash in
 the brief read-lock window; the dead-process slot reclaim keeps the table from
 filling with stale entries, so in practice it is very unlikely.
+
+An interrupted create is recovered too. A creator killed after the backing
+file is sized but before its header is committed leaves a full-size, all-zero
+file. C<new> re-initializes such a file automatically, but only when it is
+exactly the size the requested geometry needs, is owned by your effective uid,
+and is still entirely zero -- a file holding data is never re-initialized. If
+the creator got as far as writing part of the header, the file cannot be told
+apart from a corrupt one and C<new> croaks with C<incomplete ndarray file left
+by an interrupted create; remove it and retry>. A file left behind by an
+interrupted create never held data, so removing it is safe -- but a file whose
+header was corrupted after the fact reaches the same croak, so confirm it is
+an abandoned create before deleting anything you care about.
 
 =head1 SEE ALSO
 
